@@ -31,6 +31,8 @@ from src.knowledge_graph import (
 from src.vector_store import (
     SearchResult,
     VectorStoreService,
+    get_vector_store,
+    normalize_persist_directory,
 )
 from src.query_router import (
     HybridRetrievalResult,
@@ -78,6 +80,16 @@ def inject_custom_css() -> None:
 
 
 
+@st.cache_resource(show_spinner=False)
+def get_shared_vector_store(persist_dir: str = "./chroma_db") -> VectorStoreService:
+    """Streamlit cached resource provider for the shared VectorStoreService.
+
+    Ensures that across all concurrent user sessions and reruns on Streamlit Cloud,
+    exactly one VectorStoreService instance is created and safely reused.
+    """
+    return VectorStoreService(persist_directory=persist_dir)
+
+
 def _init_session_state() -> None:
     """Initialize persistent Streamlit session state keys."""
     if "theme_mode" not in st.session_state:
@@ -100,8 +112,13 @@ def _init_session_state() -> None:
         st.session_state.kg_builder = KnowledgeGraphBuilder()
     if "kg_built_signature" not in st.session_state:
         st.session_state.kg_built_signature = ""
-    if "vector_store" not in st.session_state:
-        st.session_state.vector_store = VectorStoreService(persist_directory="./chroma_db")
+    if "vector_store" not in st.session_state or st.session_state.vector_store is None:
+        try:
+            st.session_state.vector_store = get_shared_vector_store("./chroma_db")
+            st.session_state.vector_store_error = None
+        except Exception as e:
+            st.session_state.vector_store = None
+            st.session_state.vector_store_error = str(e)
     if "vector_indexed_signature" not in st.session_state:
         st.session_state.vector_indexed_signature = ""
     if "last_index_report" not in st.session_state:
@@ -1610,7 +1627,16 @@ def render_vector_store_section(full_width: bool = False) -> None:
     st.markdown("### 🗄️ Step 3: Vector Store & Semantic Retrieval")
     st.caption("Persistent ChromaDB vector collection embedding document chunks for dense similarity retrieval.")
 
-    vector_store: VectorStoreService = st.session_state.vector_store
+    vector_store: Optional[VectorStoreService] = st.session_state.get("vector_store")
+    if not vector_store:
+        vec_err = st.session_state.get("vector_store_error", "Vector database service not initialized.")
+        st.error(
+            f"⚠️ **Vector Database Unavailable**: {vec_err}\n\n"
+            f"Please verify disk read/write permissions for `{normalize_persist_directory('./chroma_db')}` "
+            f"or configure the `SYNAPSE_CHROMA_DIR` environment variable to a writable directory."
+        )
+        return
+
     stats = vector_store.get_collection_stats()
 
     # Diagnostic Metrics Row
@@ -2360,6 +2386,16 @@ def main() -> None:
 
     selected_view = render_sidebar()
     render_header()
+
+    vec_err = st.session_state.get("vector_store_error")
+    if vec_err:
+        st.warning(
+            f"⚠️ **Vector Database Service Notice**: The local ChromaDB vector store could not be initialized.\n\n"
+            f"**Diagnostic Details**: `{vec_err}`\n\n"
+            f"*Knowledge graph, document parsing, entity extraction, and reasoning engines remain active.* "
+            f"To enable dense similarity search, ensure `{normalize_persist_directory('./chroma_db')}` is writable or configure `SYNAPSE_CHROMA_DIR`.",
+            icon="⚠️",
+        )
 
     if selected_view == "🌌 Overview":
         render_overview_page()

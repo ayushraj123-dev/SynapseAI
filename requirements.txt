@@ -3,5 +3,5 @@ pytest>=8.0.0
 pymupdf>=2.0.0
 networkx>=3.0.0
 pyvis>=0.3.2
-chromadb>=1.0.0
+chromadb==1.5.9
 neo4j>=5.0.0

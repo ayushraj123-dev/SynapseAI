@@ -96,24 +96,115 @@ class LocalDeterministicEmbeddingFunction(EmbeddingFunction):
         return embeddings
 
 
+import threading
+
+def normalize_persist_directory(path: Optional[Union[str, Path]] = None) -> str:
+    """Return a single canonical, normalized absolute path string for ChromaDB persistence.
+
+    Resolves relative path segments, expands user home (~), and produces a deterministic
+    absolute path across all callers, threads, and working directories.
+    Can be overridden globally via the SYNAPSE_CHROMA_DIR environment variable.
+    """
+    if not path:
+        path = os.environ.get("SYNAPSE_CHROMA_DIR", "./chroma_db")
+    return str(Path(path).expanduser().resolve())
+
+
 class VectorStoreService:
-    """Service for managing persistent chunk embeddings and semantic similarity queries."""
+    """Service for managing persistent chunk embeddings and semantic similarity queries.
+
+    Uses a thread-safe class-level client cache to ensure that any component, thread,
+    or Streamlit rerun requesting the same canonical persistence directory reuses
+    a single ChromaDB PersistentClient instance, preventing KeyError race conditions
+    in Chroma's SharedSystemClient registry.
+    """
+
+    _client_cache: Dict[str, Any] = {}
+    _client_lock: threading.Lock = threading.Lock()
+
+    @classmethod
+    def _get_or_create_client(cls, canonical_path: str) -> Any:
+        """Thread-safe factory that creates and reuses a single Chroma client per canonical path.
+
+        Args:
+            canonical_path: Normalized, absolute directory path.
+
+        Returns:
+            Active chromadb.PersistentClient instance.
+        """
+        norm_path = normalize_persist_directory(canonical_path)
+        with cls._client_lock:
+            existing_client = cls._client_cache.get(norm_path)
+            if existing_client is not None:
+                # If the existing client hasn't been closed, reuse it
+                if not getattr(existing_client, "_closed", False):
+                    return existing_client
+
+            # Ensure the target directory exists before initializing PersistentClient
+            try:
+                Path(norm_path).mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to create canonical ChromaDB persistence directory '{norm_path}': {e}"
+                ) from e
+
+            try:
+                new_client = chromadb.PersistentClient(path=norm_path)
+                cls._client_cache[norm_path] = new_client
+                return new_client
+            except Exception as e:
+                raise RuntimeError(
+                    f"ChromaDB PersistentClient initialization failed for canonical path '{norm_path}'. "
+                    f"Underlying error ({type(e).__name__}): {e}"
+                ) from e
+
+    @classmethod
+    def close_client(cls, path: Optional[Union[str, Path]] = None) -> None:
+        """Safely close and remove cached client(s).
+
+        Args:
+            path: Optional path to close. If None, closes all cached clients.
+        """
+        with cls._client_lock:
+            if path is not None:
+                norm_path = normalize_persist_directory(path)
+                client = cls._client_cache.pop(norm_path, None)
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            else:
+                for norm_path, client in list(cls._client_cache.items()):
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                cls._client_cache.clear()
+
+    @classmethod
+    def get_cached_client(cls, path: Optional[Union[str, Path]] = None) -> Optional[Any]:
+        """Return the active cached client for the specified path, if one exists."""
+        norm_path = normalize_persist_directory(path)
+        with cls._client_lock:
+            return cls._client_cache.get(norm_path)
 
     def __init__(
         self,
-        persist_directory: str = "./chroma_db",
+        persist_directory: Optional[Union[str, Path]] = "./chroma_db",
         collection_name: str = "synapse_knowledge_base",
         embedding_function: Optional[EmbeddingFunction] = None,
+        client: Optional[Any] = None,
     ) -> None:
-        self.persist_directory = persist_directory
+        self.persist_directory = normalize_persist_directory(persist_directory)
         self.collection_name = collection_name
         self.embedding_provider_name = "default"
 
-        # Ensure persist directory exists
-        Path(self.persist_directory).mkdir(parents=True, exist_ok=True)
-
-        # Initialize ChromaDB persistent client
-        self.client = chromadb.PersistentClient(path=self.persist_directory)
+        # Initialize or reuse thread-safe ChromaDB persistent client
+        if client is not None:
+            self.client = client
+        else:
+            self.client = self._get_or_create_client(self.persist_directory)
 
         # Configure embedding function
         if embedding_function is not None:
@@ -131,12 +222,18 @@ class VectorStoreService:
                 self.embedding_function = LocalDeterministicEmbeddingFunction()
                 self.embedding_provider_name = "LocalDeterministicFallback"
 
-        # Get or create the persistent collection
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection_name,
-            embedding_function=self.embedding_function,
-            metadata={"hnsw:space": "cosine"},
-        )
+        # Get or create the persistent collection safely
+        try:
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                embedding_function=self.embedding_function,
+                metadata={"hnsw:space": "cosine"},
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to get or create collection '{self.collection_name}' in ChromaDB at '{self.persist_directory}'. "
+                f"Underlying error ({type(e).__name__}): {e}"
+            ) from e
 
     def index_chunks(
         self,
@@ -314,6 +411,9 @@ class VectorStoreService:
         results.sort(key=lambda x: x.relevance_score, reverse=True)
         return results
 
+    # Convenience alias for semantic similarity queries
+    search = similarity_search
+
     def delete_document(self, filename: str) -> int:
         """Remove all chunks associated with a specific source filename.
 
@@ -370,3 +470,17 @@ class VectorStoreService:
             return sorted(list(names))
         except Exception:
             return []
+
+
+def get_vector_store(
+    persist_directory: Optional[Union[str, Path]] = "./chroma_db",
+    collection_name: str = "synapse_knowledge_base",
+    embedding_function: Optional[EmbeddingFunction] = None,
+) -> VectorStoreService:
+    """Helper factory for obtaining a canonical VectorStoreService instance."""
+    return VectorStoreService(
+        persist_directory=persist_directory,
+        collection_name=collection_name,
+        embedding_function=embedding_function,
+    )
+
